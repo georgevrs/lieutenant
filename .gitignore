@@ -1,0 +1,27 @@
+# Lieutenant — Jarvis-style Voice Assistant
+
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+*.egg
+.eggs/
+logs/
+*.log
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+packages/voice-daemon/models/
+packages/agent-gateway/node_modules/

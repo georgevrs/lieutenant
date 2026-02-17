@@ -1,0 +1,13 @@
+# Voice Daemon
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+numpy>=1.24.0
+sounddevice>=0.4.6
+webrtcvad>=2.0.10
+vosk>=0.3.45
+faster-whisper>=0.10.0
+httpx>=0.25.0
+python-dotenv>=1.0.0
+piper-tts>=1.2.0; platform_machine != "arm64"
+aiofiles>=23.2.0
