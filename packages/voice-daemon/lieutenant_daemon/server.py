@@ -178,22 +178,36 @@ async def _start_listening():
 
 async def _process_stt():
     final_text = ""
-    silence_check_count = 0
+    listen_start = time.time()
+    MAX_LISTEN_SECONDS = 20  # hard timeout
 
     try:
         async for result in stt.results():
             if sm.state != State.LISTENING:
                 break
+
+            # Hard timeout
+            if time.time() - listen_start > MAX_LISTEN_SECONDS:
+                logger.info("Max listen time reached (%ds), ending.", MAX_LISTEN_SECONDS)
+                stt.stop_utterance()
+                continue
+
             if result.is_final:
                 final_text = result.text
                 logger.info("STT final: %s", final_text)
                 await hub.send_stt_final(final_text)
                 break
             else:
+                logger.debug("STT partial: %s", result.text)
                 await hub.send_stt_partial(result.text)
-                silence_check_count += 1
-                if stt.silence_detected and silence_check_count > 10:
+
+                # Check silence or max duration
+                if stt.silence_detected:
                     logger.info("Silence detected, ending utterance.")
+                    stt.stop_utterance()
+                    continue
+                if stt.max_duration_reached:
+                    logger.info("Max utterance frames reached, ending.")
                     stt.stop_utterance()
                     continue
     except Exception as e:
@@ -335,6 +349,9 @@ async def run_server(port: int = 8765):
     # Initialize TTS
     tts = TTSEngine(on_rms=_tts_rms_callback)
     logger.info("TTS engine initialized (backend=%s)", tts._backend)
+
+    # Pre-load STT model so first wake is instant
+    stt.preload()
 
     # Initialize wake detector
     wake = WakeDetector(on_wake=_on_wake, loop=_loop)

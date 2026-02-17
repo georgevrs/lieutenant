@@ -69,7 +69,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   btnPrimary: {
     background: "var(--accent)",
-    borderColor: "var(--accent)",
+    border: "1px solid var(--accent)",
     color: "#fff",
     boxShadow: "0 0 20px var(--accent-glow)",
   },

@@ -132,9 +132,9 @@ class WakeDetector:
         models_dir = Path(__file__).resolve().parent.parent / "models"
         models_dir.mkdir(exist_ok=True)
 
-        # Check for existing model
+        # Check for existing model (skip whisper models)
         for d in models_dir.iterdir():
-            if d.is_dir() and "gr" in d.name.lower():
+            if d.is_dir() and "gr" in d.name.lower() and "whisper" not in d.name.lower():
                 return str(d)
 
         # Check common model name
@@ -150,9 +150,9 @@ class WakeDetector:
             models_dir,
         )
 
-        # Try any model directory
+        # Try any Vosk model directory (skip whisper)
         for d in models_dir.iterdir():
-            if d.is_dir():
+            if d.is_dir() and "whisper" not in d.name.lower():
                 return str(d)
 
         return ""

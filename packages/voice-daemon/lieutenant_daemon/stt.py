@@ -40,18 +40,56 @@ class STTEngine:
         self._result_queue: asyncio.Queue[STTResult] = asyncio.Queue()
         self._thread: threading.Thread | None = None
         self._backend = "none"
+        self._model = None  # cached whisper model
+
+        # ── Adaptive silence detection ────────────────────────────────
         self._silence_frames = 0
-        self._max_silence = 30  # ~2s of silence at 16kHz/1024 blocks
+        self._max_silence = 25  # ~1.6s of silence at 16kHz/1024 blocks
+        self._total_frames = 0
+        self._max_total_frames = 240  # ~15s max utterance
+        self._noise_floor: float = 0.0
+        self._noise_samples: list[float] = []
+        self._noise_calibrated = False
+        self._NOISE_CALIBRATION_FRAMES = 8  # first ~0.5s
+        self._SILENCE_FACTOR = 1.3  # silence threshold = noise_floor * factor
+        self._MIN_SILENCE_THRESHOLD = 0.015  # absolute minimum
 
     @property
     def backend(self) -> str:
         return self._backend
+
+    def preload(self):
+        """Pre-load the whisper model so first wake is instant."""
+        try:
+            from faster_whisper import WhisperModel
+            import pathlib
+            
+            # Try local model first
+            local_model = pathlib.Path(__file__).parent.parent / "models" / "whisper-base"
+            if local_model.exists():
+                logger.info("Pre-loading local whisper model from %s…", local_model)
+                self._model = WhisperModel(str(local_model), device="cpu", compute_type="int8")
+                self._backend = "faster-whisper"
+                logger.info("faster-whisper model ready (local).")
+            else:
+                logger.info("Pre-loading faster-whisper model '%s'…", _MODEL_SIZE)
+                self._model = WhisperModel(_MODEL_SIZE, device="cpu", compute_type="int8")
+                self._backend = "faster-whisper"
+                logger.info("faster-whisper model ready.")
+        except ImportError:
+            logger.warning("faster-whisper not installed, will try Vosk at runtime.")
+        except Exception as e:
+            logger.warning("Failed to pre-load whisper model: %s", e)
 
     def start_utterance(self, loop: asyncio.AbstractEventLoop):
         """Begin capturing an utterance."""
         self._active = True
         self._audio_buffer.clear()
         self._silence_frames = 0
+        self._total_frames = 0
+        self._noise_samples.clear()
+        self._noise_calibrated = False
+        self._noise_floor = 0.0
         # Clear queues
         while not self._audio_queue.empty():
             try:
@@ -75,10 +113,23 @@ class STTEngine:
             return
         self._audio_buffer.append(audio.copy())
         self._audio_queue.put(audio.copy())
+        self._total_frames += 1
 
-        # Simple silence detection (VAD)
+        # ── Adaptive silence detection ────────────────────────────────
         rms = float(np.sqrt(np.mean((audio.astype(np.float32) / 32768.0) ** 2)))
-        if rms < 0.01:
+
+        # Calibrate noise floor from first N frames
+        if not self._noise_calibrated:
+            self._noise_samples.append(rms)
+            if len(self._noise_samples) >= self._NOISE_CALIBRATION_FRAMES:
+                self._noise_floor = float(np.median(self._noise_samples))
+                self._noise_calibrated = True
+                threshold = max(self._noise_floor * self._SILENCE_FACTOR, self._MIN_SILENCE_THRESHOLD)
+                logger.info("Noise floor calibrated: %.4f (silence threshold: %.4f)", self._noise_floor, threshold)
+            return  # don't check silence during calibration
+
+        threshold = max(self._noise_floor * self._SILENCE_FACTOR, self._MIN_SILENCE_THRESHOLD)
+        if rms < threshold:
             self._silence_frames += 1
         else:
             self._silence_frames = 0
@@ -86,7 +137,12 @@ class STTEngine:
     @property
     def silence_detected(self) -> bool:
         """True if extended silence detected (end of utterance)."""
-        return self._silence_frames > self._max_silence
+        return self._noise_calibrated and self._silence_frames > self._max_silence
+
+    @property
+    def max_duration_reached(self) -> bool:
+        """True if we've been listening for too long."""
+        return self._total_frames > self._max_total_frames
 
     async def results(self) -> AsyncIterator[STTResult]:
         """Async generator yielding partial and final results."""
@@ -119,15 +175,28 @@ class STTEngine:
     def _transcribe_whisper(self, loop: asyncio.AbstractEventLoop):
         """Use faster-whisper for transcription."""
         from faster_whisper import WhisperModel
+        import pathlib
 
-        self._backend = "faster-whisper"
-        logger.info("Loading faster-whisper model '%s'…", _MODEL_SIZE)
-        model = WhisperModel(_MODEL_SIZE, device="cpu", compute_type="int8")
-        logger.info("faster-whisper model loaded.")
+        if self._model is not None:
+            model = self._model
+            logger.info("Using pre-loaded faster-whisper model.")
+        else:
+            self._backend = "faster-whisper"
+            # Try local model first
+            local_model = pathlib.Path(__file__).parent.parent / "models" / "whisper-base"
+            if local_model.exists():
+                logger.info("Loading local whisper model from %s…", local_model)
+                model = WhisperModel(str(local_model), device="cpu", compute_type="int8")
+            else:
+                logger.info("Loading faster-whisper model '%s'…", _MODEL_SIZE)
+                model = WhisperModel(_MODEL_SIZE, device="cpu", compute_type="int8")
+            self._model = model
+            logger.info("faster-whisper model loaded.")
 
         # Collect all audio
         chunks: list[np.ndarray] = []
         partial_sent = ""
+        last_partial_time = time.time()
 
         while True:
             try:
@@ -136,24 +205,27 @@ class STTEngine:
                     break
                 chunks.append(frame)
 
-                # Every ~1s of audio, do a partial transcription
+                # Only do partial transcription every ~4s to avoid CPU overload
                 total_samples = sum(len(c) for c in chunks)
-                if total_samples >= SAMPLE_RATE:  # ~1s
+                elapsed = time.time() - last_partial_time
+                if total_samples >= SAMPLE_RATE * 4 and elapsed > 3:  # 4s of audio, 3s since last partial
                     audio_np = np.concatenate(chunks).astype(np.float32) / 32768.0
                     segments, _ = model.transcribe(
                         audio_np,
                         language="el",
                         beam_size=1,
                         best_of=1,
-                        vad_filter=True,
+                        vad_filter=False,  # Disable VAD - it's too aggressive
                     )
                     text = " ".join(seg.text.strip() for seg in segments)
                     if text and text != partial_sent:
                         partial_sent = text
+                        logger.info("STT partial: %s", text)
                         asyncio.run_coroutine_threadsafe(
                             self._result_queue.put(STTResult(text, is_final=False)),
                             loop,
                         )
+                        last_partial_time = time.time()
             except queue.Empty:
                 if not self._active:
                     break
@@ -161,14 +233,16 @@ class STTEngine:
 
         # Final transcription on all audio
         if chunks:
+            logger.info("Transcribing final audio (%.1fs)...", sum(len(c) for c in chunks) / SAMPLE_RATE)
             audio_np = np.concatenate(chunks).astype(np.float32) / 32768.0
             segments, _ = model.transcribe(
                 audio_np,
                 language="el",
-                beam_size=5,
-                vad_filter=True,
+                beam_size=3,  # Reduce beam size for speed
+                vad_filter=False,  # Disable VAD
             )
             final_text = " ".join(seg.text.strip() for seg in segments)
+            logger.info("STT final result: '%s'", final_text or "(empty)")
             asyncio.run_coroutine_threadsafe(
                 self._result_queue.put(STTResult(final_text or "(no speech detected)", is_final=True)),
                 loop,
