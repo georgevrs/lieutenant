@@ -17,6 +17,7 @@ load_dotenv(_env_path)
 
 from app.routes.chat import router as chat_router
 from app.routes.models import router as models_router
+from app.routes.language import router as lang_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,3 +51,4 @@ app.add_middleware(
 
 app.include_router(models_router, prefix="/v1")
 app.include_router(chat_router, prefix="/v1")
+app.include_router(lang_router, prefix="/v1")
