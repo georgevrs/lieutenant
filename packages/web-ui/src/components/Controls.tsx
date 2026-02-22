@@ -1,21 +1,34 @@
-/* ── Controls — Kill switch + Wake button ───────────────────────── */
+/* ── Controls — Kill switch + Wake button + Language toggle ──────── */
 
 import React from "react";
 import type { DaemonState } from "../types";
 
 interface Props {
   state: DaemonState;
+  language: string;
   onWake: () => void;
   onKill: () => void;
   onToggleSettings: () => void;
+  onToggleLanguage: () => void;
 }
 
-export function Controls({ state, onWake, onKill, onToggleSettings }: Props) {
+export function Controls({ state, language, onWake, onKill, onToggleSettings, onToggleLanguage }: Props) {
+  const isGreek = language === "el";
+
   return (
     <div style={styles.bar}>
       {/* Settings */}
-      <button onClick={onToggleSettings} style={styles.btnSmall} title="Ρυθμίσεις">
+      <button onClick={onToggleSettings} style={styles.btnSmall} title={isGreek ? "Ρυθμίσεις" : "Settings"}>
         ⚙
+      </button>
+
+      {/* Language toggle */}
+      <button
+        onClick={onToggleLanguage}
+        style={styles.btnSmall}
+        title={isGreek ? "Switch to English" : "Αλλαγή σε Ελληνικά"}
+      >
+        {isGreek ? "🇬🇷" : "🇬🇧"}
       </button>
 
       {/* Wake / PTT */}
@@ -27,7 +40,13 @@ export function Controls({ state, onWake, onKill, onToggleSettings }: Props) {
         }}
         disabled={state !== "IDLE"}
       >
-        {state === "IDLE" ? "🎤  Υπολοχαγέ" : state === "LISTENING" ? "Ακούω…" : "…"}
+        {state === "IDLE"
+          ? isGreek
+            ? "🎤  Υπολοχαγέ"
+            : "🎤  Lieutenant"
+          : state === "LISTENING"
+            ? isGreek ? "Ακούω…" : "Listening…"
+            : "…"}
       </button>
 
       {/* Kill switch */}

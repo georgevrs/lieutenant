@@ -26,8 +26,10 @@ export interface DaemonStore {
   agentDone: boolean;
   error: string | null;
   logs: LogEntry[];
+  language: string;
   simulateWake: () => void;
   killSwitch: () => void;
+  setLanguage: (lang: string) => void;
 }
 
 export function useDaemon(): DaemonStore {
@@ -42,6 +44,7 @@ export function useDaemon(): DaemonStore {
   const [agentDone, setAgentDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [language, setLanguageState] = useState("el");
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -52,6 +55,13 @@ export function useDaemon(): DaemonStore {
     ws.onopen = () => {
       setConnected(true);
       setError(null);
+      // Fetch current language
+      fetch(
+        `http://127.0.0.1:${import.meta.env.VITE_DAEMON_PORT ?? 8765}/control/language`
+      )
+        .then((r) => r.json())
+        .then((d) => setLanguageState(d.language ?? "el"))
+        .catch(() => {});
     };
 
     ws.onclose = () => {
@@ -104,6 +114,9 @@ export function useDaemon(): DaemonStore {
           case "error":
             setError((msg as any).message);
             break;
+          case "language":
+            setLanguageState((msg as any).value ?? "el");
+            break;
           case "log": {
             const entry: LogEntry = {
               ts: (msg as any).ts ?? Date.now() / 1000,
@@ -144,6 +157,25 @@ export function useDaemon(): DaemonStore {
 
   const simulateWake = useCallback(() => httpPost("/control/wake"), [httpPost]);
   const killSwitch = useCallback(() => httpPost("/control/stop"), [httpPost]);
+  const setLanguage = useCallback(
+    async (lang: string) => {
+      try {
+        const r = await fetch(
+          `http://127.0.0.1:${import.meta.env.VITE_DAEMON_PORT ?? 8765}/control/language`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ language: lang }),
+          }
+        );
+        const d = await r.json();
+        setLanguageState(d.language ?? lang);
+      } catch {
+        // ignore
+      }
+    },
+    []
+  );
 
   return {
     state,
@@ -156,7 +188,9 @@ export function useDaemon(): DaemonStore {
     agentDone,
     error,
     logs,
+    language,
     simulateWake,
     killSwitch,
+    setLanguage,
   };
 }

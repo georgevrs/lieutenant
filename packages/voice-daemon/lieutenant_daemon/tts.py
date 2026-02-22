@@ -47,13 +47,14 @@ class TTSEngine:
                 pass
         logger.info("TTS cancelled.")
 
-    async def speak(self, text: str) -> bool:
+    async def speak(self, text: str, language: str = "el") -> bool:
         """
         Speak the text. Returns True if completed, False if cancelled.
         Splits into sentences and speaks each.
         """
         self._cancelled = False
         self._playing = True
+        self._language = language
 
         sentences = self._split_sentences(text)
         if not sentences:
@@ -111,7 +112,8 @@ class TTSEngine:
         """Use macOS 'say' command."""
         self._backend = "say"
 
-        # Check for Greek voice
+        # Select voice based on language
+        lang = getattr(self, '_language', 'el')
         voice_flag = []
         try:
             result = subprocess.run(
@@ -120,12 +122,22 @@ class TTSEngine:
                 text=True,
                 timeout=5,
             )
-            # Look for Greek voice
-            for line in result.stdout.splitlines():
-                if "el_GR" in line or "Melina" in line:
-                    voice_name = line.split()[0]
-                    voice_flag = ["-v", voice_name]
-                    break
+            if lang == "el":
+                # Look for Greek voice
+                for line in result.stdout.splitlines():
+                    if "el_GR" in line or "Melina" in line:
+                        voice_name = line.split()[0]
+                        voice_flag = ["-v", voice_name]
+                        break
+            elif lang == "en":
+                # Use a good English voice (Samantha, Alex, etc.)
+                for preferred in ("Samantha", "Alex", "Daniel"):
+                    for line in result.stdout.splitlines():
+                        if line.startswith(preferred) and "en_" in line:
+                            voice_flag = ["-v", preferred]
+                            break
+                    if voice_flag:
+                        break
         except Exception:
             pass
 
@@ -173,9 +185,10 @@ class TTSEngine:
     async def _speak_espeak(self, text: str) -> bool:
         """Fallback: use espeak for Linux."""
         self._backend = "espeak"
+        lang = getattr(self, '_language', 'el')
         try:
             self._process = subprocess.Popen(
-                ["espeak", "-v", "el", text],
+                ["espeak", "-v", lang, text],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -208,7 +221,7 @@ class TTSEngine:
 
             self._backend = "azure"
             config = speechsdk.SpeechConfig(subscription=key, region=region)
-            config.speech_synthesis_voice_name = "el-GR-AthinaNeural"
+            config.speech_synthesis_voice_name = "el-GR-AthinaNeural" if getattr(self, '_language', 'el') == 'el' else "en-US-JennyNeural"
             synthesizer = speechsdk.SpeechSynthesizer(speech_config=config)
 
             result = synthesizer.speak_text_async(text).get()

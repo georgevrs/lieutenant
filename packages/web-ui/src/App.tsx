@@ -58,9 +58,13 @@ export function App() {
       <footer style={styles.footer}>
         <Controls
           state={daemon.state}
+          language={daemon.language}
           onWake={daemon.simulateWake}
           onKill={daemon.killSwitch}
           onToggleSettings={() => setSettingsOpen(true)}
+          onToggleLanguage={() =>
+            daemon.setLanguage(daemon.language === "el" ? "en" : "el")
+          }
         />
       </footer>
 
@@ -158,8 +162,6 @@ const styles: Record<string, React.CSSProperties> = {
   },
   waveformContainer: {
     width: "100%",
-    maxWidth: "900px",
-    margin: "0 auto",
     padding: "8px 0",
   },
   error: {

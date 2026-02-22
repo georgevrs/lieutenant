@@ -17,7 +17,7 @@ import numpy as np
 logger = logging.getLogger("lieutenant-daemon")
 
 _WAKE_PHRASE = os.getenv("WAKE_PHRASE", "υπολοχαγέ").lower()
-_COOLDOWN = 2.0  # seconds between triggers
+_COOLDOWN = 1.2  # seconds between triggers — fast re-triggering
 
 
 class WakeDetector:
@@ -35,6 +35,12 @@ class WakeDetector:
         self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=200)
         self._running = False
         self._thread: threading.Thread | None = None
+        self._wake_phrase = _WAKE_PHRASE
+
+    def set_wake_phrase(self, phrase: str):
+        """Change the wake phrase dynamically (e.g. when switching language)."""
+        self._wake_phrase = phrase.lower()
+        logger.info("Wake phrase changed to: '%s'", self._wake_phrase)
 
     @property
     def enabled(self) -> bool:
@@ -88,7 +94,7 @@ class WakeDetector:
             model = Model(model_path)
             self._recognizer = KaldiRecognizer(model, 16000)
             self._recognizer.SetWords(False)
-            logger.info("Wake detector ready. Listening for '%s'", _WAKE_PHRASE)
+            logger.info("Wake detector ready. Listening for '%s'", self._wake_phrase)
 
             while self._running:
                 try:
@@ -104,7 +110,7 @@ class WakeDetector:
                     text = result.get("text", "").lower()
                     if text:
                         logger.debug("Vosk heard: %s", text)
-                    if _WAKE_PHRASE in text:
+                    if self._wake_phrase in text:
                         now = time.time()
                         if now - self._last_trigger > _COOLDOWN:
                             self._last_trigger = now
@@ -113,7 +119,7 @@ class WakeDetector:
                 else:
                     partial = json.loads(self._recognizer.PartialResult())
                     partial_text = partial.get("partial", "").lower()
-                    if _WAKE_PHRASE in partial_text:
+                    if self._wake_phrase in partial_text:
                         now = time.time()
                         if now - self._last_trigger > _COOLDOWN:
                             self._last_trigger = now

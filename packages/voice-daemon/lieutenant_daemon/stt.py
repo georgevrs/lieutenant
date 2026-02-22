@@ -42,17 +42,23 @@ class STTEngine:
         self._backend = "none"
         self._model = None  # cached whisper model
 
-        # ── Adaptive silence detection ────────────────────────────────
+        # ── Adaptive silence detection (Siri-like) ─────────────────────
         self._silence_frames = 0
-        self._max_silence = 25  # ~1.6s of silence at 16kHz/1024 blocks
+        self._max_silence = 25  # ~1.6s of silence after speech ends
         self._total_frames = 0
-        self._max_total_frames = 240  # ~15s max utterance
+        self._max_total_frames = 250  # ~16s max utterance
         self._noise_floor: float = 0.0
         self._noise_samples: list[float] = []
         self._noise_calibrated = False
-        self._NOISE_CALIBRATION_FRAMES = 8  # first ~0.5s
-        self._SILENCE_FACTOR = 1.3  # silence threshold = noise_floor * factor
-        self._MIN_SILENCE_THRESHOLD = 0.015  # absolute minimum
+        self._speech_detected = False  # Siri-like: must hear speech first
+        self._speech_frames = 0  # count frames with speech energy
+        self._peak_rms: float = 0.0  # track loudest frame seen
+        self._MIN_SPEECH_FRAMES = 3  # require at least ~0.2s of speech
+        self._NOISE_CALIBRATION_FRAMES = 8  # first ~0.5s for calibration
+        self._SILENCE_FACTOR = 4.0  # silence threshold = noise_floor * factor
+        self._MIN_SILENCE_THRESHOLD = 0.002  # absolute minimum (was 0.015 — way too high)
+        self._SPEECH_THRESHOLD_FACTOR = 6.0  # speech = noise_floor * this
+        self._language = "el"  # current language for transcription
 
     @property
     def backend(self) -> str:
@@ -81,15 +87,19 @@ class STTEngine:
         except Exception as e:
             logger.warning("Failed to pre-load whisper model: %s", e)
 
-    def start_utterance(self, loop: asyncio.AbstractEventLoop):
+    def start_utterance(self, loop: asyncio.AbstractEventLoop, language: str = "el"):
         """Begin capturing an utterance."""
         self._active = True
+        self._language = language
         self._audio_buffer.clear()
         self._silence_frames = 0
         self._total_frames = 0
         self._noise_samples.clear()
         self._noise_calibrated = False
         self._noise_floor = 0.0
+        self._speech_detected = False
+        self._speech_frames = 0
+        self._peak_rms = 0.0
         # Clear queues
         while not self._audio_queue.empty():
             try:
@@ -103,8 +113,18 @@ class STTEngine:
         self._thread.start()
 
     def stop_utterance(self):
-        """Signal end of utterance."""
+        """Signal end of utterance — drain queue so transcription thread exits fast."""
         self._active = False
+        # Drain pending audio frames so the thread doesn't process stale data
+        drained = 0
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+        if drained:
+            logger.info("Drained %d queued audio frames", drained)
         self._audio_queue.put(None)  # Sentinel
 
     def feed_audio(self, audio: np.ndarray):
@@ -129,23 +149,45 @@ class STTEngine:
             return  # don't check silence during calibration
 
         threshold = max(self._noise_floor * self._SILENCE_FACTOR, self._MIN_SILENCE_THRESHOLD)
-        if rms < threshold:
-            self._silence_frames += 1
-        else:
-            self._silence_frames = 0
+        speech_threshold = max(self._noise_floor * self._SPEECH_THRESHOLD_FACTOR, self._MIN_SILENCE_THRESHOLD * 2)
+
+        # Track peak RMS for adaptive thresholds
+        if rms > self._peak_rms:
+            self._peak_rms = rms
+
+        # Track whether user has started speaking
+        if rms >= speech_threshold:
+            self._speech_frames += 1
+            if self._speech_frames >= self._MIN_SPEECH_FRAMES and not self._speech_detected:
+                self._speech_detected = True
+                logger.info("Speech energy detected (rms=%.4f, threshold=%.4f, peak=%.4f)",
+                            rms, speech_threshold, self._peak_rms)
+
+        # Only count silence AFTER speech has been detected (Siri-like)
+        if self._speech_detected:
+            if rms < threshold:
+                self._silence_frames += 1
+            else:
+                self._silence_frames = 0
 
     @property
     def silence_detected(self) -> bool:
-        """True if extended silence detected (end of utterance)."""
-        return self._noise_calibrated and self._silence_frames > self._max_silence
+        """True if speech was heard and then extended silence followed (Siri-like)."""
+        return self._noise_calibrated and self._speech_detected and self._silence_frames > self._max_silence
 
     @property
     def max_duration_reached(self) -> bool:
         """True if we've been listening for too long."""
         return self._total_frames > self._max_total_frames
 
+    @property
+    def speech_was_detected(self) -> bool:
+        """True if speech energy was detected during the current utterance."""
+        return self._speech_detected
+
     async def results(self) -> AsyncIterator[STTResult]:
-        """Async generator yielding partial and final results."""
+        """Async generator yielding partial and final results.
+        Yields empty heartbeat results on timeout so callers can check silence."""
         while True:
             try:
                 result = await asyncio.wait_for(self._result_queue.get(), timeout=0.1)
@@ -154,8 +196,12 @@ class STTEngine:
                     return
             except asyncio.TimeoutError:
                 if not self._active and self._result_queue.empty():
+                    # If transcription thread is still running, wait for it
+                    if self._thread and self._thread.is_alive():
+                        continue  # keep waiting for the final result
                     return
-                continue
+                # Yield heartbeat so caller can check silence/timeout
+                yield STTResult("", is_final=False)
 
     def _transcribe_loop(self, loop: asyncio.AbstractEventLoop):
         """Background thread: accumulate audio and transcribe."""
@@ -203,21 +249,26 @@ class STTEngine:
                 frame = self._audio_queue.get(timeout=0.5)
                 if frame is None:
                     break
+                if not self._active:
+                    break  # Bail out quickly if stopped
                 chunks.append(frame)
 
-                # Only do partial transcription every ~4s to avoid CPU overload
+                # Partial transcription every ~2s for faster feedback
+                # Only transcribe if speech energy has been detected (avoid Whisper hallucinations on silence)
                 total_samples = sum(len(c) for c in chunks)
                 elapsed = time.time() - last_partial_time
-                if total_samples >= SAMPLE_RATE * 4 and elapsed > 3:  # 4s of audio, 3s since last partial
+                if self._speech_detected and total_samples >= SAMPLE_RATE * 2 and elapsed > 2:
                     audio_np = np.concatenate(chunks).astype(np.float32) / 32768.0
                     segments, _ = model.transcribe(
                         audio_np,
-                        language="el",
+                        language=self._language,
                         beam_size=1,
                         best_of=1,
                         vad_filter=False,  # Disable VAD - it's too aggressive
                     )
                     text = " ".join(seg.text.strip() for seg in segments)
+                    # Always update timer to prevent re-transcribing every frame
+                    last_partial_time = time.time()
                     if text and text != partial_sent:
                         partial_sent = text
                         logger.info("STT partial: %s", text)
@@ -225,7 +276,6 @@ class STTEngine:
                             self._result_queue.put(STTResult(text, is_final=False)),
                             loop,
                         )
-                        last_partial_time = time.time()
             except queue.Empty:
                 if not self._active:
                     break
@@ -235,13 +285,33 @@ class STTEngine:
         if chunks:
             logger.info("Transcribing final audio (%.1fs)...", sum(len(c) for c in chunks) / SAMPLE_RATE)
             audio_np = np.concatenate(chunks).astype(np.float32) / 32768.0
-            segments, _ = model.transcribe(
+            segments_iter, info = model.transcribe(
                 audio_np,
-                language="el",
-                beam_size=3,  # Reduce beam size for speed
+                language=self._language,
+                beam_size=2,  # Minimal beam for fastest transcription
                 vad_filter=False,  # Disable VAD
             )
-            final_text = " ".join(seg.text.strip() for seg in segments)
+            # Filter out segments with high no-speech probability (hallucinations)
+            good_segments = []
+            for seg in segments_iter:
+                if seg.no_speech_prob > 0.7:
+                    logger.info("Filtered hallucinated segment (no_speech_prob=%.2f): '%s'", seg.no_speech_prob, seg.text.strip())
+                    continue
+                good_segments.append(seg.text.strip())
+            final_text = " ".join(good_segments)
+
+            # Detect repeated hallucination pattern (same phrase 3+ times)
+            if final_text:
+                words = final_text.split()
+                if len(words) >= 6:
+                    # Check if the text is just the same short phrase repeated
+                    half = len(words) // 2
+                    first_half = " ".join(words[:half])
+                    second_half = " ".join(words[half:2*half])
+                    if first_half == second_half:
+                        logger.info("Filtered repetitive hallucination: '%s'", final_text[:80])
+                        final_text = ""
+
             logger.info("STT final result: '%s'", final_text or "(empty)")
             asyncio.run_coroutine_threadsafe(
                 self._result_queue.put(STTResult(final_text or "(no speech detected)", is_final=True)),

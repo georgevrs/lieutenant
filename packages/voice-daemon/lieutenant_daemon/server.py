@@ -7,9 +7,11 @@ import logging
 import os
 import time
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 import uvicorn
 
@@ -22,6 +24,14 @@ from lieutenant_daemon.tts import TTSEngine
 from lieutenant_daemon.agent_client import stream_agent_response
 
 logger = logging.getLogger("lieutenant-daemon")
+
+# ── Language ──────────────────────────────────────────────────────────
+_current_language = os.getenv("LANGUAGE", "el")  # "el" or "en"
+_GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8800"))
+
+_ACK_PHRASES = {"el": "Διατάξτε", "en": "At your command"}
+_WAKE_PHRASES = {"el": "υπολοχαγέ", "en": "lieutenant"}
+
 
 # ── Globals ───────────────────────────────────────────────────────────
 sm = StateMachine()
@@ -127,6 +137,40 @@ async def ctrl_ptt_stop():
     return JSONResponse({"ok": True, "state": sm.state.value})
 
 
+class LanguageRequest(BaseModel):
+    language: str  # "el" or "en"
+
+
+@app.get("/control/language")
+async def get_language():
+    return JSONResponse({"language": _current_language})
+
+
+@app.post("/control/language")
+async def set_language(body: LanguageRequest):
+    global _current_language
+    lang = body.language if body.language in ("el", "en") else "el"
+    _current_language = lang
+
+    # Update wake detector phrase
+    if wake:
+        wake.set_wake_phrase(_WAKE_PHRASES.get(lang, "υπολοχαγέ"))
+
+    # Propagate to agent-gateway
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                f"http://127.0.0.1:{_GATEWAY_PORT}/v1/language",
+                json={"language": lang},
+            )
+    except Exception as e:
+        logger.warning("Could not propagate language to gateway: %s", e)
+
+    logger.info("Language switched to: %s", lang)
+    await hub.broadcast({"type": "language", "value": lang, "ts": time.time()})
+    return JSONResponse({"ok": True, "language": lang})
+
+
 @app.get("/status")
 async def status():
     return {
@@ -160,6 +204,16 @@ async def _on_wake():
             return
         return
 
+    # Speak acknowledgment before listening (like Siri's chime)
+    ack = _ACK_PHRASES.get(_current_language, "Διατάξτε")
+    if tts:
+        logger.info("Speaking acknowledgment: %s", ack)
+        await sm.transition(State.SPEAKING)
+        await hub.send_state(State.SPEAKING.value)
+        if wake:
+            wake.enabled = False
+        await tts.speak(ack, language=_current_language)
+
     await sm.transition(State.LISTENING)
     await hub.send_state(State.LISTENING.value)
     await _start_listening()
@@ -172,14 +226,14 @@ async def _start_listening():
     if wake:
         wake.enabled = False
 
-    stt.start_utterance(_loop)
+    stt.start_utterance(_loop, language=_current_language)
     asyncio.create_task(_process_stt())
 
 
 async def _process_stt():
     final_text = ""
     listen_start = time.time()
-    MAX_LISTEN_SECONDS = 20  # hard timeout
+    MAX_LISTEN_SECONDS = 30  # hard timeout — generous for Siri-like flow
 
     try:
         async for result in stt.results():
@@ -190,7 +244,18 @@ async def _process_stt():
             if time.time() - listen_start > MAX_LISTEN_SECONDS:
                 logger.info("Max listen time reached (%ds), ending.", MAX_LISTEN_SECONDS)
                 stt.stop_utterance()
-                continue
+                # Don't continue — fall through to drain the final result below
+                break
+
+            # Check silence after speech
+            if stt.silence_detected:
+                logger.info("Silence detected, ending utterance.")
+                stt.stop_utterance()
+                break
+            if stt.max_duration_reached:
+                logger.info("Max utterance frames reached, ending.")
+                stt.stop_utterance()
+                break
 
             if result.is_final:
                 final_text = result.text
@@ -198,23 +263,32 @@ async def _process_stt():
                 await hub.send_stt_final(final_text)
                 break
             else:
-                logger.debug("STT partial: %s", result.text)
-                await hub.send_stt_partial(result.text)
-
-                # Check silence or max duration
-                if stt.silence_detected:
-                    logger.info("Silence detected, ending utterance.")
-                    stt.stop_utterance()
-                    continue
-                if stt.max_duration_reached:
-                    logger.info("Max utterance frames reached, ending.")
-                    stt.stop_utterance()
-                    continue
+                if result.text:
+                    logger.debug("STT partial: %s", result.text)
+                    await hub.send_stt_partial(result.text)
     except Exception as e:
         logger.error("STT processing error: %s", e)
         await hub.send_error(str(e))
         await _kill_switch()
         return
+
+    # ── Drain remaining results to catch the final transcription ──────
+    if not final_text:
+        logger.info("Draining STT queue for final result…")
+        try:
+            async for result in stt.results():
+                if result.is_final:
+                    final_text = result.text
+                    logger.info("STT final (drained): %s", final_text)
+                    await hub.send_stt_final(final_text)
+                    break
+        except Exception:
+            pass  # timeout is fine
+
+    # If no speech energy was ever detected, discard STT output (likely hallucination)
+    if not stt.speech_was_detected and final_text:
+        logger.info("No speech energy detected — discarding STT output as hallucination: '%s'", final_text[:60])
+        final_text = ""
 
     if not final_text or final_text.strip() in ("", "(no speech detected)", "(no speech)", "(STT unavailable)"):
         logger.info("No speech detected, returning to IDLE.")
@@ -288,14 +362,14 @@ async def _query_agent(text: str):
 
 async def _speak_sentence(text: str):
     if tts and sm.state == State.SPEAKING:
-        await tts.speak(text)
+        await tts.speak(text, language=_current_language)
 
 
 def _should_flush_tts(buffer: str) -> bool:
     for char in ".!;·…\n":
-        if char in buffer and len(buffer) > 10:
+        if char in buffer and len(buffer) > 5:
             return True
-    if len(buffer) > 150:
+    if len(buffer) > 80:
         return True
     return False
 
