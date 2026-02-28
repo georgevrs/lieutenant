@@ -15,6 +15,9 @@ logger = logging.getLogger("lieutenant-daemon")
 _GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8800"))
 _GATEWAY_URL = f"http://127.0.0.1:{_GATEWAY_PORT}/v1/chat/completions"
 
+# Module-level: which LLM backend served the last request
+last_llm_backend: str = "unknown"
+
 
 async def stream_agent_response(
     user_text: str,
@@ -64,6 +67,10 @@ async def stream_agent_response(
 
                             try:
                                 data = json.loads(data_str)
+                                # Track LLM backend from final chunk
+                                if "x_backend" in data:
+                                    global last_llm_backend
+                                    last_llm_backend = data["x_backend"]
                                 choices = data.get("choices", [])
                                 if choices:
                                     delta = choices[0].get("delta", {})

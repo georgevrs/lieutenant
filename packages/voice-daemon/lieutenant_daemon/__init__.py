@@ -10,8 +10,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load .env from repo root
-_env_path = Path(__file__).resolve().parents[2] / ".env"
+# Load .env from repo root (parents: [0]=lieutenant_daemon, [1]=voice-daemon, [2]=packages, [3]=Lieutenant)
+_env_path = Path(__file__).resolve().parents[3] / ".env"
 load_dotenv(_env_path)
 
 logging.basicConfig(

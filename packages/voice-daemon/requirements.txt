@@ -5,9 +5,13 @@ websockets>=12.0
 numpy>=1.24.0
 sounddevice>=0.4.6
 webrtcvad>=2.0.10
-vosk>=0.3.45
+vosk>=0.3.38
 faster-whisper>=0.10.0
 httpx>=0.25.0
 python-dotenv>=1.0.0
-piper-tts>=1.2.0; platform_machine != "arm64"
 aiofiles>=23.2.0
+
+# ── Upgraded STT/TTS ──
+edge-tts>=7.0.0
+torch>=2.0.0
+torchaudio>=2.0.0

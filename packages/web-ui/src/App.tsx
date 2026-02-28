@@ -4,16 +4,19 @@ import React, { useState } from "react";
 import { useDaemon } from "./hooks/useDaemon";
 import { Waveform } from "./components/Waveform";
 import { StateIndicator } from "./components/StateIndicator";
-import { Transcript } from "./components/Transcript";
-import { AgentResponse } from "./components/AgentResponse";
+import { ChatPanel } from "./components/ChatPanel";
 import { Controls } from "./components/Controls";
 import { Settings } from "./components/Settings";
 import { LogPanel } from "./components/LogPanel";
+import type { Lang } from "./i18n";
+import { t } from "./i18n";
 
 export function App() {
   const daemon = useDaemon();
+  const APP_VERSION = (import.meta.env.VITE_APP_VERSION as string) || "1.0.0";
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [logsOpen, setLogsOpen] = useState(false);
+  const lang = daemon.language as Lang;
 
   return (
     <div style={styles.root}>
@@ -28,48 +31,71 @@ export function App() {
         </div>
       </header>
 
-      {/* Main content */}
+      {/* Spacer to push waveform toward vertical center */}
+      <div style={{ flex: 1 }} />
+
+      {/* State indicator */}
+      <StateIndicator
+        state={daemon.state}
+        connected={daemon.connected}
+        llmBackend={daemon.llmBackend}
+        language={lang}
+      />
+
+      {/* Waveform — vertically centered */}
+      <div style={styles.waveformContainer}>
+        <Waveform
+          state={daemon.state}
+          micRms={daemon.micRms}
+          ttsRms={daemon.ttsRms}
+        />
+      </div>
+
+      {/* Conversation — scrollable, below waveform */}
       <main style={styles.main}>
-        {/* State indicator */}
-        <StateIndicator state={daemon.state} connected={daemon.connected} />
-
-        {/* Transcript (above waveform) */}
-        <Transcript partial={daemon.sttPartial} final_={daemon.sttFinal} />
-
-        {/* Waveform */}
-        <div style={styles.waveformContainer}>
-          <Waveform
-            state={daemon.state}
-            micRms={daemon.micRms}
-            ttsRms={daemon.ttsRms}
-          />
-        </div>
-
-        {/* Agent response (below waveform) */}
-        <AgentResponse text={daemon.agentText} done={daemon.agentDone} />
-
-        {/* Error display */}
-        {daemon.error && (
-          <div style={styles.error}>⚠ {daemon.error}</div>
-        )}
+        <ChatPanel
+          messages={daemon.chatMessages}
+          sttPartial={daemon.sttPartial}
+          language={lang}
+          displayName={daemon.settings.display_name}
+        />
       </main>
+
+      {/* Error display */}
+      {daemon.error && (
+        <div style={styles.error}>⚠ {daemon.error}</div>
+      )}
 
       {/* Controls */}
       <footer style={styles.footer}>
-        <Controls
-          state={daemon.state}
-          language={daemon.language}
-          onWake={daemon.simulateWake}
-          onKill={daemon.killSwitch}
-          onToggleSettings={() => setSettingsOpen(true)}
-          onToggleLanguage={() =>
-            daemon.setLanguage(daemon.language === "el" ? "en" : "el")
-          }
-        />
+        <div style={styles.controlsRow}>
+          <Controls
+            state={daemon.state}
+            language={daemon.language}
+            onWake={daemon.simulateWake}
+            onKill={daemon.killSwitch}
+            onToggleSettings={() => setSettingsOpen(true)}
+            onToggleLanguage={() =>
+              daemon.setLanguage(daemon.language === "el" ? "en" : "el")
+            }
+          />
+        </div>
+
+        <div style={styles.footerMeta}>
+          <span style={styles.version}>v{APP_VERSION}</span>
+          <span style={styles.attribution}>
+              Proudly presented by <a style={styles.link} href="https://github.com/georgevrs" target="_blank" rel="noopener noreferrer">George Verouchis</a>
+          </span>
+        </div>
       </footer>
 
       {/* Settings drawer */}
-      <Settings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <Settings
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        language={lang}
+        settings={daemon.settings}
+      />
 
       {/* Log panel */}
       <LogPanel open={logsOpen} logs={daemon.logs} onClose={() => setLogsOpen(false)} />
@@ -96,7 +122,7 @@ export function App() {
           transition: "all 0.2s",
           boxShadow: logsOpen ? "0 0 12px var(--accent-glow)" : "none",
         }}
-        title={logsOpen ? "Hide Logs" : "Show Logs"}
+        title={logsOpen ? t("logs.hide", lang) : t("logs.show", lang)}
       >
         ⌸
       </button>
@@ -132,7 +158,8 @@ const styles: Record<string, React.CSSProperties> = {
     zIndex: 1,
     display: "flex",
     justifyContent: "center",
-    padding: "20px 24px 0",
+    padding: "16px 24px 0",
+    flexShrink: 0,
   },
   logo: {
     display: "flex",
@@ -154,15 +181,16 @@ const styles: Record<string, React.CSSProperties> = {
     flex: 1,
     display: "flex",
     flexDirection: "column",
-    justifyContent: "center",
-    alignItems: "stretch",
     position: "relative",
     zIndex: 1,
-    padding: "0 24px",
+    minHeight: 0, /* allow flex child to shrink & scroll */
   },
   waveformContainer: {
     width: "100%",
-    padding: "8px 0",
+    padding: "8px 24px",
+    flexShrink: 0,
+    position: "relative",
+    zIndex: 1,
   },
   error: {
     textAlign: "center",
@@ -172,12 +200,39 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--error)",
     background: "rgba(248, 113, 113, 0.1)",
     borderRadius: "6px",
-    margin: "8px auto",
-    maxWidth: "600px",
+    margin: "4px 24px",
+    flexShrink: 0,
   },
   footer: {
     position: "relative",
     zIndex: 1,
     paddingBottom: "16px",
+    flexShrink: 0,
+  },
+  controlsRow: {
+    display: "flex",
+    justifyContent: "center",
+    padding: "8px 24px",
+  },
+  footerMeta: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "6px",
+    padding: "6px 24px 12px",
+    color: "var(--text-dim)",
+    fontSize: "12px",
+  },
+  version: {
+    fontFamily: "var(--font-mono)",
+    color: "var(--text-dim)",
+  },
+  attribution: {
+    textAlign: "center",
+  },
+  link: {
+    color: "var(--accent)",
+    textDecoration: "none",
   },
 };

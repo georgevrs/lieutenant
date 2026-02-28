@@ -67,14 +67,14 @@ class AgentCore:
     """Agent with OpenClaw WS streaming, Gemini fallback, and local tool dispatch."""
 
     def __init__(self):
-        self._has_openclaw = bool(_OPENCLAW_TOKEN)
+        import shutil
+        self._has_openclaw = bool(shutil.which("openclaw"))
         self._has_google = bool(_GOOGLE_KEY)
         self._has_openai = bool(_OPENAI_KEY)
-        self._openclaw_ws = None
-        self._openclaw_connected = False
+        self.last_backend = "none"  # Track which LLM backend served the last request
 
         if self._has_openclaw:
-            logger.info("OpenClaw token detected — will use OpenClaw WS gateway as primary.")
+            logger.info("OpenClaw CLI detected — will use as primary LLM backend.")
         if self._has_google:
             logger.info("Google Gemini key detected — will use as fallback.")
         if not self._has_openclaw and not self._has_google and not self._has_openai:
@@ -107,6 +107,7 @@ class AgentCore:
         # Stream from OpenClaw (primary)
         if self._has_openclaw:
             try:
+                self.last_backend = "openclaw"
                 async for token in self._openclaw_stream(user_text):
                     yield token
                 return
@@ -115,152 +116,129 @@ class AgentCore:
 
         # Stream from Gemini (fallback)
         if self._has_google:
+            self.last_backend = "gemini"
             async for token in self._gemini_stream(messages):
                 yield token
             return
 
         if self._has_openai:
+            self.last_backend = "openai"
             async for token in self._openai_stream(messages):
                 yield token
             return
 
         # Fallback local
+        self.last_backend = "local"
         async for token in self._local_fallback(user_text):
             yield token
 
-    # ── OpenClaw WS streaming ─────────────────────────────────────────
+    # ── OpenClaw via CLI subprocess (reliable, uses CLI auth) ───────────
     async def _openclaw_stream(self, user_text: str) -> AsyncIterator[str]:
-        """Connect to OpenClaw WS gateway, send agent request, yield streaming tokens."""
-        import websockets
+        """Call OpenClaw agent via the CLI subprocess.
+
+        The OpenClaw WS gateway requires device-key auth for operator.write scope,
+        which is only available through the official CLI. Using the CLI as a subprocess
+        is reliable and avoids the scope issue entirely.
+        """
+        import shutil
+        import subprocess
+
+        openclaw_bin = shutil.which("openclaw")
+        if not openclaw_bin:
+            raise RuntimeError("openclaw CLI not found in PATH")
 
         t0 = time.time()
-        first_token = True
         idem_key = uuid.uuid4().hex
 
-        logger.info("OpenClaw: connecting to %s", _OPENCLAW_WS_URL)
+        extra_prompt = _SYSTEM_PROMPTS.get(_current_language, _SYSTEM_PROMPTS["el"])
+        # Explicitly instruct the language in the message to override any agent defaults
+        if _current_language == "en":
+            augmented_text = f"[Respond in English] {user_text}"
+        else:
+            augmented_text = user_text
 
-        async with websockets.connect(_OPENCLAW_WS_URL, close_timeout=5) as ws:
-            # Step 1: Wait for challenge
-            raw = await asyncio.wait_for(ws.recv(), timeout=5)
-            challenge = json.loads(raw)
-            if challenge.get("type") != "event" or challenge.get("event") != "connect.challenge":
-                raise RuntimeError(f"Unexpected challenge: {challenge}")
+        params_json = json.dumps({
+            "message": augmented_text,
+            "agentId": "main",
+            "idempotencyKey": idem_key,
+            "extraSystemPrompt": extra_prompt,
+        })
 
-            # Step 2: Send connect
-            connect_req = {
-                "type": "req",
-                "id": uuid.uuid4().hex,
-                "method": "connect",
-                "params": {
-                    "minProtocol": 3,
-                    "maxProtocol": 3,
-                    "client": {
-                        "id": "gateway-client",
-                        "displayName": "Lieutenant",
-                        "version": "0.1.0",
-                        "platform": "darwin",
-                        "mode": "backend",
-                    },
-                    "caps": [],
-                    "auth": {"token": _OPENCLAW_TOKEN},
-                    "role": "operator",
-                    "scopes": ["operator.admin"],
-                },
-            }
-            await ws.send(json.dumps(connect_req))
+        cmd = [
+            openclaw_bin, "gateway", "call", "agent",
+            "--params", params_json,
+            "--expect-final",
+            "--timeout", "60000",
+            "--json",
+        ]
 
-            # Wait for hello-ok
-            raw = await asyncio.wait_for(ws.recv(), timeout=5)
-            hello = json.loads(raw)
-            if hello.get("ok") is not True:
-                err = hello.get("error", {}).get("message", "unknown")
-                raise RuntimeError(f"Connect failed: {err}")
+        logger.info("OpenClaw: calling agent via CLI (%d chars)", len(user_text))
 
-            logger.info("OpenClaw: connected in %.2fs", time.time() - t0)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
-            # Step 3: Send agent request
-            agent_req_id = uuid.uuid4().hex
-            extra_prompt = _SYSTEM_PROMPTS.get(_current_language, _SYSTEM_PROMPTS["el"])
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=65
+        )
 
-            agent_req = {
-                "type": "req",
-                "id": agent_req_id,
-                "method": "agent",
-                "params": {
-                    "message": user_text,
-                    "agentId": "main",
-                    "idempotencyKey": idem_key,
-                    "extraSystemPrompt": extra_prompt,
-                },
-            }
-            await ws.send(json.dumps(agent_req))
-            logger.info("OpenClaw: agent request sent (%d chars)", len(user_text))
+        stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
 
-            # Step 4: Read events until final response
-            seen_text = ""
-            accepted = False
-            while True:
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=60)
-                except asyncio.TimeoutError:
-                    logger.warning("OpenClaw: timeout waiting for response")
-                    break
+        if proc.returncode != 0:
+            err_msg = stderr or stdout or f"exit code {proc.returncode}"
+            raise RuntimeError(f"OpenClaw CLI error: {err_msg}")
 
-                msg = json.loads(raw)
-                msg_type = msg.get("type", "?")
-                msg_event = msg.get("event", "")
+        # Parse the JSON output
+        try:
+            result = json.loads(stdout)
+        except json.JSONDecodeError:
+            # Sometimes CLI prepends banner text; try to find JSON
+            json_start = stdout.find("{")
+            if json_start >= 0:
+                result = json.loads(stdout[json_start:])
+            else:
+                raise RuntimeError(f"OpenClaw: invalid JSON response: {stdout[:200]}")
 
-                # Streaming delta from assistant
-                if (msg_type == "event" and msg_event == "agent"
-                        and msg.get("payload", {}).get("stream") == "assistant"):
-                    delta = msg["payload"].get("data", {}).get("delta", "")
-                    if delta:
-                        if first_token:
-                            logger.info("OpenClaw: first token in %.2fs", time.time() - t0)
-                            first_token = False
-                        yield delta
-                        seen_text += delta
+        # Extract text from result
+        text = ""
+        payloads = result.get("result", {}).get("payloads", [])
+        if payloads:
+            text = payloads[0].get("text", "")
 
-                # Acceptance response (not the final result)
-                elif msg_type == "res" and msg.get("id") == agent_req_id:
-                    payload = msg.get("payload", {})
-                    if payload.get("status") == "accepted":
-                        accepted = True
-                        logger.info("OpenClaw: agent request accepted (runId=%s)", payload.get("runId", "?")[:16])
-                        continue
-                    # Non-accepted res — might be an error
-                    if not msg.get("ok"):
-                        err = msg.get("error", {}).get("message", "unknown error")
-                        logger.error("OpenClaw agent error: %s", err)
-                        yield f"(OpenClaw error: {err})"
-                        break
-                    # Unexpected ok res — log and continue
-                    logger.info("OpenClaw: unexpected res payload: %s", json.dumps(payload, ensure_ascii=False)[:200])
-                    continue
+        if not text:
+            # Try alternate paths
+            text = result.get("text", "") or result.get("message", "")
 
-                # Final chat event
-                elif msg_type == "event" and msg_event == "chat":
-                    state = msg.get("payload", {}).get("state", "")
-                    if state == "final":
-                        # Extract full text from final event if no streaming was received
-                        if not seen_text:
-                            payloads = msg.get("payload", {}).get("result", {}).get("payloads", [])
-                            if payloads:
-                                full_text = payloads[0].get("text", "")
-                                if full_text:
-                                    yield full_text
-                                    seen_text = full_text
-                        meta = msg.get("payload", {}).get("result", {}).get("meta", {})
-                        agent_meta = meta.get("agentMeta", {})
-                        model = agent_meta.get("model", "")
-                        dur = meta.get("durationMs", 0)
-                        logger.info("OpenClaw: complete in %.2fs (model=%s, agent_dur=%dms, text_len=%d)",
-                                    time.time() - t0, model, dur, len(seen_text))
-                        break
+        elapsed = time.time() - t0
+        logger.info("OpenClaw: complete in %.2fs (text_len=%d)", elapsed, len(text))
 
-                # Skip health/tick events
-                elif msg_type == "event" and msg_event in ("health", "tick"):
-                    continue
+        if text:
+            # Yield in sentence-sized chunks for faster TTS start
+            for chunk in self._chunk_text(text):
+                yield chunk
+        else:
+            raise RuntimeError("OpenClaw returned empty response")
+
+    @staticmethod
+    def _chunk_text(text: str, max_chunk: int = 80) -> list[str]:
+        """Split text into sentence-sized chunks for progressive TTS."""
+        import re as _re
+        # Split on sentence boundaries
+        parts = _re.split(r'(?<=[.!;·…\n])\s+', text)
+        chunks = []
+        buf = ""
+        for p in parts:
+            if buf and len(buf) + len(p) > max_chunk:
+                chunks.append(buf)
+                buf = p
+            else:
+                buf = (buf + " " + p).strip() if buf else p
+        if buf:
+            chunks.append(buf)
+        return chunks if chunks else [text]
 
     # ── Google Gemini streaming ───────────────────────────────────────
     async def _gemini_stream(self, messages: list) -> AsyncIterator[str]:

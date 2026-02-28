@@ -2,24 +2,43 @@
 
 import type { DaemonState } from "../types";
 import React from "react";
+import { t, type Lang } from "../i18n";
 
 interface Props {
   state: DaemonState;
   connected: boolean;
+  llmBackend?: string;
+  language: Lang;
 }
 
-const STATE_META: Record<
-  DaemonState,
-  { label: string; icon: string; color: string }
-> = {
-  IDLE: { label: "Αναμονή", icon: "◉", color: "var(--accent)" },
-  LISTENING: { label: "Ακούω…", icon: "🎤", color: "var(--success)" },
-  THINKING: { label: "Σκέφτομαι…", icon: "⚡", color: "var(--warning)" },
-  SPEAKING: { label: "Μιλάω…", icon: "🔊", color: "var(--accent)" },
+const STATE_KEYS: Record<DaemonState, string> = {
+  IDLE: "state.idle",
+  LISTENING: "state.listening",
+  THINKING: "state.thinking",
+  SPEAKING: "state.speaking",
+  CONVERSING: "state.conversing",
 };
 
-export function StateIndicator({ state, connected }: Props) {
-  const meta = STATE_META[state];
+const STATE_ICONS: Record<DaemonState, string> = {
+  IDLE: "◉",
+  LISTENING: "🎤",
+  THINKING: "⚡",
+  SPEAKING: "🔊",
+  CONVERSING: "💬",
+};
+
+const STATE_COLORS: Record<DaemonState, string> = {
+  IDLE: "var(--accent)",
+  LISTENING: "var(--success)",
+  THINKING: "var(--warning)",
+  SPEAKING: "var(--accent)",
+  CONVERSING: "var(--success)",
+};
+
+export function StateIndicator({ state, connected, llmBackend, language }: Props) {
+  const label = t(STATE_KEYS[state] as any, language);
+  const icon = STATE_ICONS[state];
+  const color = STATE_COLORS[state];
 
   return (
     <div style={styles.container}>
@@ -35,15 +54,13 @@ export function StateIndicator({ state, connected }: Props) {
       />
 
       {/* State */}
-      <span style={{ ...styles.icon }}>{meta.icon}</span>
-      <span
-        style={{
-          ...styles.label,
-          color: meta.color,
-        }}
-      >
-        {meta.label}
-      </span>
+      <span style={styles.icon}>{icon}</span>
+      <span style={{ ...styles.label, color }}>{label}</span>
+
+      {/* LLM Backend badge */}
+      {llmBackend && llmBackend !== "\u2014" && (
+        <span style={styles.badge}>{llmBackend.toUpperCase()}</span>
+      )}
     </div>
   );
 }
@@ -71,5 +88,17 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 500,
     letterSpacing: "0.05em",
     textTransform: "uppercase" as const,
+  },
+  badge: {
+    fontFamily: "var(--font-mono)",
+    fontSize: "9px",
+    fontWeight: 600,
+    letterSpacing: "0.08em",
+    padding: "2px 6px",
+    borderRadius: "3px",
+    background: "rgba(108, 99, 255, 0.15)",
+    color: "var(--accent)",
+    border: "1px solid rgba(108, 99, 255, 0.3)",
+    marginLeft: "4px",
   },
 };

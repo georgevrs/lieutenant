@@ -1,6 +1,6 @@
 /* ── Types for Lieutenant UI ─────────────────────────────────────── */
 
-export type DaemonState = "IDLE" | "LISTENING" | "THINKING" | "SPEAKING";
+export type DaemonState = "IDLE" | "LISTENING" | "THINKING" | "SPEAKING" | "CONVERSING";
 
 export interface WSMessage {
   type: string;

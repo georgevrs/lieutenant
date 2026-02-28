@@ -74,12 +74,12 @@ async def _stream_response(request: Request, chat_req: ChatRequest):
             ),
         }
 
-    # Final chunk
+    # Final chunk — include which LLM backend was used
+    final_chunk = _make_chunk(chat_id, {}, "stop")
+    final_chunk["x_backend"] = agent.last_backend
     yield {
         "event": "message",
-        "data": json.dumps(
-            _make_chunk(chat_id, {}, "stop")
-        ),
+        "data": json.dumps(final_chunk),
     }
     yield {"event": "message", "data": "[DONE]"}
 

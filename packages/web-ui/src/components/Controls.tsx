@@ -2,6 +2,7 @@
 
 import React from "react";
 import type { DaemonState } from "../types";
+import { t, type Lang } from "../i18n";
 
 interface Props {
   state: DaemonState;
@@ -13,12 +14,12 @@ interface Props {
 }
 
 export function Controls({ state, language, onWake, onKill, onToggleSettings, onToggleLanguage }: Props) {
-  const isGreek = language === "el";
+  const lang = language as Lang;
 
   return (
     <div style={styles.bar}>
       {/* Settings */}
-      <button onClick={onToggleSettings} style={styles.btnSmall} title={isGreek ? "Ρυθμίσεις" : "Settings"}>
+      <button onClick={onToggleSettings} style={styles.btnSmall} title={t("ctrl.settings", lang)}>
         ⚙
       </button>
 
@@ -26,9 +27,9 @@ export function Controls({ state, language, onWake, onKill, onToggleSettings, on
       <button
         onClick={onToggleLanguage}
         style={styles.btnSmall}
-        title={isGreek ? "Switch to English" : "Αλλαγή σε Ελληνικά"}
+        title={t("ctrl.langSwitch", lang)}
       >
-        {isGreek ? "🇬🇷" : "🇬🇧"}
+        {lang === "el" ? "🇬🇷" : "🇬🇧"}
       </button>
 
       {/* Wake / PTT */}
@@ -36,17 +37,17 @@ export function Controls({ state, language, onWake, onKill, onToggleSettings, on
         onClick={onWake}
         style={{
           ...styles.btn,
-          ...(state === "IDLE" ? styles.btnPrimary : styles.btnDisabled),
+          ...(state === "IDLE" || state === "CONVERSING" ? styles.btnPrimary : styles.btnDisabled),
         }}
-        disabled={state !== "IDLE"}
+        disabled={state !== "IDLE" && state !== "CONVERSING"}
       >
         {state === "IDLE"
-          ? isGreek
-            ? "🎤  Υπολοχαγέ"
-            : "🎤  Lieutenant"
-          : state === "LISTENING"
-            ? isGreek ? "Ακούω…" : "Listening…"
-            : "…"}
+          ? t("ctrl.wake", lang)
+          : state === "CONVERSING"
+            ? t("ctrl.conversing", lang)
+            : state === "LISTENING"
+              ? t("ctrl.listening", lang)
+              : "…"}
       </button>
 
       {/* Kill switch */}
@@ -60,7 +61,7 @@ export function Controls({ state, language, onWake, onKill, onToggleSettings, on
         disabled={state === "IDLE"}
         title="Kill Switch"
       >
-        ■ Stop
+        {t("ctrl.stop", lang)}
       </button>
     </div>
   );

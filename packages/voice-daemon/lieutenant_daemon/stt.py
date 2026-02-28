@@ -1,4 +1,4 @@
-"""STT engine — streaming speech-to-text with faster-whisper or Vosk."""
+"""STT engine — streaming speech-to-text with faster-whisper (medium) + Silero VAD."""
 
 from __future__ import annotations
 
@@ -17,7 +17,10 @@ logger = logging.getLogger("lieutenant-daemon")
 
 SAMPLE_RATE = 16000
 _STT_BACKEND = os.getenv("STT_BACKEND", "local")
-_MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "base")
+_MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "medium")
+
+# NOTE: Do NOT use initial_prompt — it causes Whisper to hallucinate the prompt
+# text itself on silence/quiet audio. language="el" is sufficient to force Greek.
 
 
 class STTResult:
@@ -29,7 +32,8 @@ class STTResult:
 
 class STTEngine:
     """
-    Streaming STT using faster-whisper for best quality.
+    Streaming STT using faster-whisper (medium model) for best Greek quality.
+    Uses Silero VAD for robust ML-based speech/silence boundary detection.
     Falls back to Vosk if faster-whisper unavailable.
     """
 
@@ -41,47 +45,78 @@ class STTEngine:
         self._thread: threading.Thread | None = None
         self._backend = "none"
         self._model = None  # cached whisper model
+        self._vad_model = None  # Silero VAD model
 
-        # ── Adaptive silence detection (Siri-like) ─────────────────────
+        # ── Silero VAD state ──────────────────────────────────────────
+        self._vad_triggered = False   # True once VAD detected speech
+        self._vad_silence_ms = 0      # consecutive silence milliseconds
+        self._vad_speech_ms = 0       # total speech milliseconds
+        self._VAD_SILENCE_THRESHOLD_MS = 800   # 0.8s silence after speech → end (snappy)
+        self._VAD_MIN_SPEECH_MS = 150          # require ≥150ms speech
+        self._VAD_PROB_THRESHOLD = 0.25        # Lowered from 0.5 — laptop mics are quiet
+
+        # ── RMS fallback state (when Silero unavailable) ──────────────
         self._silence_frames = 0
-        self._max_silence = 25  # ~1.6s of silence after speech ends
-        self._total_frames = 0
-        self._max_total_frames = 250  # ~16s max utterance
+        self._max_silence = 15             # ~1s at 64ms/frame (was 25)
         self._noise_floor: float = 0.0
         self._noise_samples: list[float] = []
         self._noise_calibrated = False
-        self._speech_detected = False  # Siri-like: must hear speech first
-        self._speech_frames = 0  # count frames with speech energy
-        self._peak_rms: float = 0.0  # track loudest frame seen
-        self._MIN_SPEECH_FRAMES = 3  # require at least ~0.2s of speech
-        self._NOISE_CALIBRATION_FRAMES = 8  # first ~0.5s for calibration
-        self._SILENCE_FACTOR = 4.0  # silence threshold = noise_floor * factor
-        self._MIN_SILENCE_THRESHOLD = 0.002  # absolute minimum (was 0.015 — way too high)
-        self._SPEECH_THRESHOLD_FACTOR = 6.0  # speech = noise_floor * this
-        self._language = "el"  # current language for transcription
+        self._speech_frames = 0
+        self._peak_rms: float = 0.0
+        self._MIN_SPEECH_FRAMES = 3
+        self._NOISE_CALIBRATION_FRAMES = 8
+        self._SILENCE_FACTOR = 4.0
+        self._MIN_SILENCE_THRESHOLD = 0.002
+        self._SPEECH_THRESHOLD_FACTOR = 6.0
+
+        # ── Utterance limits ──────────────────────────────────────────
+        self._total_frames = 0
+        self._max_total_frames = 250  # ~16s max utterance
+        self._speech_detected = False
+        self._rms_speech_detected = False
+        self._language = "el"
+        self._listen_start_time = 0.0  # Track when listening started
+        self._NO_SPEECH_TIMEOUT = 5.0  # If no speech after 5s, give up
 
     @property
     def backend(self) -> str:
         return self._backend
 
     def preload(self):
-        """Pre-load the whisper model so first wake is instant."""
+        """Pre-load Whisper model + Silero VAD so first wake is instant."""
+        self._preload_vad()
+        self._preload_whisper()
+
+    def _preload_vad(self):
+        """Pre-load Silero VAD model."""
+        try:
+            import torch
+            torch.set_num_threads(1)
+            model, _ = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                trust_repo=True,
+            )
+            self._vad_model = model
+            logger.info("Silero VAD model loaded (ML-based speech detection).")
+        except Exception as e:
+            logger.warning("Silero VAD not available, falling back to RMS: %s", e)
+
+    def _preload_whisper(self):
+        """Pre-load the faster-whisper model."""
         try:
             from faster_whisper import WhisperModel
             import pathlib
-            
-            # Try local model first
-            local_model = pathlib.Path(__file__).parent.parent / "models" / "whisper-base"
+
+            local_model = pathlib.Path(__file__).parent.parent / "models" / f"whisper-{_MODEL_SIZE}"
             if local_model.exists():
                 logger.info("Pre-loading local whisper model from %s…", local_model)
                 self._model = WhisperModel(str(local_model), device="cpu", compute_type="int8")
-                self._backend = "faster-whisper"
-                logger.info("faster-whisper model ready (local).")
             else:
-                logger.info("Pre-loading faster-whisper model '%s'…", _MODEL_SIZE)
+                logger.info("Pre-loading faster-whisper '%s' (first time may download ~1.5 GB)…", _MODEL_SIZE)
                 self._model = WhisperModel(_MODEL_SIZE, device="cpu", compute_type="int8")
-                self._backend = "faster-whisper"
-                logger.info("faster-whisper model ready.")
+            self._backend = "faster-whisper"
+            logger.info("faster-whisper '%s' ready.", _MODEL_SIZE)
         except ImportError:
             logger.warning("faster-whisper not installed, will try Vosk at runtime.")
         except Exception as e:
@@ -92,14 +127,29 @@ class STTEngine:
         self._active = True
         self._language = language
         self._audio_buffer.clear()
-        self._silence_frames = 0
         self._total_frames = 0
-        self._noise_samples.clear()
+        self._speech_detected = False
+        self._rms_speech_detected = False
+        self._listen_start_time = time.time()
+
+        # Reset VAD state
+        self._vad_triggered = False
+        self._vad_silence_ms = 0
+        self._vad_speech_ms = 0
+        if self._vad_model is not None:
+            try:
+                self._vad_model.reset_states()
+            except Exception:
+                pass
+
+        # Reset RMS fallback state
+        self._silence_frames = 0
+        self._noise_samples = []
         self._noise_calibrated = False
         self._noise_floor = 0.0
-        self._speech_detected = False
         self._speech_frames = 0
         self._peak_rms = 0.0
+
         # Clear queues
         while not self._audio_queue.empty():
             try:
@@ -115,7 +165,6 @@ class STTEngine:
     def stop_utterance(self):
         """Signal end of utterance — drain queue so transcription thread exits fast."""
         self._active = False
-        # Drain pending audio frames so the thread doesn't process stale data
         drained = 0
         while not self._audio_queue.empty():
             try:
@@ -135,36 +184,86 @@ class STTEngine:
         self._audio_queue.put(audio.copy())
         self._total_frames += 1
 
-        # ── Adaptive silence detection ────────────────────────────────
+        # ── Speech/silence detection — use BOTH Silero + RMS ─────────────
+        if self._vad_model is not None:
+            self._run_vad(audio)
+        # Always run RMS as backup / co-signal
+        self._run_rms_vad(audio)
+
+        # If either detector found speech, mark it
+        if not self._speech_detected and self._rms_speech_detected:
+            self._speech_detected = True
+            self._vad_triggered = True
+            logger.info("RMS fallback promoted speech_detected (Silero missed it)")
+
+    def _run_vad(self, audio: np.ndarray):
+        """Run Silero VAD on the audio chunk.
+
+        Silero VAD at 16kHz accepts chunk sizes: 256, 512, 768, 1024, 1536.
+        Our BLOCK_SIZE=1024, so we feed the whole frame directly.
+        We also apply gain boost so quiet laptop mics register properly.
+        """
+        import torch
+
+        audio_f32 = audio.astype(np.float32) / 32768.0
+
+        # ── Auto-gain: boost quiet audio so Silero can detect speech ──
+        peak = np.max(np.abs(audio_f32))
+        if peak > 0:
+            # Target peak of 0.9 but cap gain at 30x to avoid amplifying pure noise
+            gain = min(0.9 / peak, 30.0)
+            if gain > 1.5:  # Only boost if meaningfully quiet
+                audio_f32 = audio_f32 * gain
+
+        tensor = torch.from_numpy(audio_f32)
+
+        try:
+            speech_prob = self._vad_model(tensor, SAMPLE_RATE).item()
+        except Exception as e:
+            logger.debug("Silero VAD error: %s", e)
+            return
+
+        chunk_ms = len(audio) * 1000 // SAMPLE_RATE  # 64ms per 1024 samples
+
+        if speech_prob >= self._VAD_PROB_THRESHOLD:
+            self._vad_speech_ms += chunk_ms
+            self._vad_silence_ms = 0
+            if not self._speech_detected and self._vad_speech_ms >= self._VAD_MIN_SPEECH_MS:
+                self._speech_detected = True
+                self._vad_triggered = True
+                logger.info("VAD: speech onset (prob=%.2f, speech_ms=%d)",
+                            speech_prob, self._vad_speech_ms)
+        else:
+            if self._vad_triggered:
+                self._vad_silence_ms += chunk_ms
+
+    def _run_rms_vad(self, audio: np.ndarray):
+        """RMS energy-based speech detection — always runs alongside Silero."""
         rms = float(np.sqrt(np.mean((audio.astype(np.float32) / 32768.0) ** 2)))
 
-        # Calibrate noise floor from first N frames
         if not self._noise_calibrated:
             self._noise_samples.append(rms)
             if len(self._noise_samples) >= self._NOISE_CALIBRATION_FRAMES:
                 self._noise_floor = float(np.median(self._noise_samples))
                 self._noise_calibrated = True
                 threshold = max(self._noise_floor * self._SILENCE_FACTOR, self._MIN_SILENCE_THRESHOLD)
-                logger.info("Noise floor calibrated: %.4f (silence threshold: %.4f)", self._noise_floor, threshold)
-            return  # don't check silence during calibration
+                logger.info("Noise floor calibrated: %.4f (threshold: %.4f)", self._noise_floor, threshold)
+            return
 
         threshold = max(self._noise_floor * self._SILENCE_FACTOR, self._MIN_SILENCE_THRESHOLD)
         speech_threshold = max(self._noise_floor * self._SPEECH_THRESHOLD_FACTOR, self._MIN_SILENCE_THRESHOLD * 2)
 
-        # Track peak RMS for adaptive thresholds
         if rms > self._peak_rms:
             self._peak_rms = rms
 
-        # Track whether user has started speaking
         if rms >= speech_threshold:
             self._speech_frames += 1
-            if self._speech_frames >= self._MIN_SPEECH_FRAMES and not self._speech_detected:
-                self._speech_detected = True
-                logger.info("Speech energy detected (rms=%.4f, threshold=%.4f, peak=%.4f)",
+            if self._speech_frames >= self._MIN_SPEECH_FRAMES and not self._rms_speech_detected:
+                self._rms_speech_detected = True
+                logger.info("RMS: speech detected (rms=%.4f, threshold=%.4f, peak=%.4f)",
                             rms, speech_threshold, self._peak_rms)
 
-        # Only count silence AFTER speech has been detected (Siri-like)
-        if self._speech_detected:
+        if self._rms_speech_detected:
             if rms < threshold:
                 self._silence_frames += 1
             else:
@@ -172,17 +271,28 @@ class STTEngine:
 
     @property
     def silence_detected(self) -> bool:
-        """True if speech was heard and then extended silence followed (Siri-like)."""
-        return self._noise_calibrated and self._speech_detected and self._silence_frames > self._max_silence
+        """True if speech was heard and then extended silence followed."""
+        # Silero VAD check
+        if self._vad_model is not None and self._vad_triggered:
+            if self._vad_silence_ms >= self._VAD_SILENCE_THRESHOLD_MS:
+                return True
+        # RMS check
+        if self._noise_calibrated and self._rms_speech_detected and self._silence_frames > self._max_silence:
+            return True
+        # No-speech timeout — if nothing detected after N seconds, end
+        if not self._speech_detected and self._listen_start_time > 0:
+            elapsed = time.time() - self._listen_start_time
+            if elapsed > self._NO_SPEECH_TIMEOUT:
+                logger.info("No speech timeout (%.1fs) — ending utterance.", elapsed)
+                return True
+        return False
 
     @property
     def max_duration_reached(self) -> bool:
-        """True if we've been listening for too long."""
         return self._total_frames > self._max_total_frames
 
     @property
     def speech_was_detected(self) -> bool:
-        """True if speech energy was detected during the current utterance."""
         return self._speech_detected
 
     async def results(self) -> AsyncIterator[STTResult]:
@@ -196,11 +306,9 @@ class STTEngine:
                     return
             except asyncio.TimeoutError:
                 if not self._active and self._result_queue.empty():
-                    # If transcription thread is still running, wait for it
                     if self._thread and self._thread.is_alive():
-                        continue  # keep waiting for the final result
+                        continue
                     return
-                # Yield heartbeat so caller can check silence/timeout
                 yield STTResult("", is_final=False)
 
     def _transcribe_loop(self, loop: asyncio.AbstractEventLoop):
@@ -219,27 +327,23 @@ class STTEngine:
                 )
 
     def _transcribe_whisper(self, loop: asyncio.AbstractEventLoop):
-        """Use faster-whisper for transcription."""
+        """Use faster-whisper (medium) with Greek-optimized settings."""
         from faster_whisper import WhisperModel
         import pathlib
 
         if self._model is not None:
             model = self._model
-            logger.info("Using pre-loaded faster-whisper model.")
+            logger.info("Using pre-loaded faster-whisper '%s'.", _MODEL_SIZE)
         else:
             self._backend = "faster-whisper"
-            # Try local model first
-            local_model = pathlib.Path(__file__).parent.parent / "models" / "whisper-base"
+            local_model = pathlib.Path(__file__).parent.parent / "models" / f"whisper-{_MODEL_SIZE}"
             if local_model.exists():
-                logger.info("Loading local whisper model from %s…", local_model)
                 model = WhisperModel(str(local_model), device="cpu", compute_type="int8")
             else:
-                logger.info("Loading faster-whisper model '%s'…", _MODEL_SIZE)
                 model = WhisperModel(_MODEL_SIZE, device="cpu", compute_type="int8")
             self._model = model
-            logger.info("faster-whisper model loaded.")
 
-        # Collect all audio
+        # Collect audio
         chunks: list[np.ndarray] = []
         partial_sent = ""
         last_partial_time = time.time()
@@ -250,24 +354,29 @@ class STTEngine:
                 if frame is None:
                     break
                 if not self._active:
-                    break  # Bail out quickly if stopped
+                    break
                 chunks.append(frame)
 
-                # Partial transcription every ~2s for faster feedback
-                # Only transcribe if speech energy has been detected (avoid Whisper hallucinations on silence)
+                # Partial transcription every ~1.5s for responsive feedback
                 total_samples = sum(len(c) for c in chunks)
                 elapsed = time.time() - last_partial_time
-                if self._speech_detected and total_samples >= SAMPLE_RATE * 2 and elapsed > 2:
+                if self._speech_detected and total_samples >= SAMPLE_RATE * 1.5 and elapsed > 1.5:
                     audio_np = np.concatenate(chunks).astype(np.float32) / 32768.0
+                    # Auto-gain for partials too
+                    p = float(np.max(np.abs(audio_np)))
+                    if p > 0.001:
+                        g = min(0.8 / p, 50.0)
+                        if g > 1.5:
+                            audio_np = np.clip(audio_np * g, -1.0, 1.0)
                     segments, _ = model.transcribe(
                         audio_np,
                         language=self._language,
                         beam_size=1,
                         best_of=1,
-                        vad_filter=False,  # Disable VAD - it's too aggressive
+                        vad_filter=False,
+                        condition_on_previous_text=False,
                     )
                     text = " ".join(seg.text.strip() for seg in segments)
-                    # Always update timer to prevent re-transcribing every frame
                     last_partial_time = time.time()
                     if text and text != partial_sent:
                         partial_sent = text
@@ -281,30 +390,46 @@ class STTEngine:
                     break
                 continue
 
-        # Final transcription on all audio
+        # ── Final transcription with fast settings ─────────────────
         if chunks:
-            logger.info("Transcribing final audio (%.1fs)...", sum(len(c) for c in chunks) / SAMPLE_RATE)
+            audio_duration = sum(len(c) for c in chunks) / SAMPLE_RATE
             audio_np = np.concatenate(chunks).astype(np.float32) / 32768.0
+
+            # ── Normalize audio amplitude ─────────────────────────────
+            peak = float(np.max(np.abs(audio_np)))
+            if peak > 0.001:
+                gain = min(0.8 / peak, 50.0)
+                if gain > 1.5:
+                    logger.info("Audio auto-gain: %.1fx (peak was %.4f)", gain, peak)
+                    audio_np = np.clip(audio_np * gain, -1.0, 1.0)
+
+            t_start = time.time()
+            logger.info("Transcribing final audio (%.1fs) with beam_size=1…", audio_duration)
+
             segments_iter, info = model.transcribe(
                 audio_np,
                 language=self._language,
-                beam_size=2,  # Minimal beam for fastest transcription
-                vad_filter=False,  # Disable VAD
+                beam_size=1,
+                best_of=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
             )
-            # Filter out segments with high no-speech probability (hallucinations)
+
             good_segments = []
             for seg in segments_iter:
-                if seg.no_speech_prob > 0.7:
-                    logger.info("Filtered hallucinated segment (no_speech_prob=%.2f): '%s'", seg.no_speech_prob, seg.text.strip())
+                if seg.no_speech_prob > 0.6:
+                    logger.info("Filtered hallucination (no_speech=%.2f): '%s'",
+                                seg.no_speech_prob, seg.text.strip())
                     continue
                 good_segments.append(seg.text.strip())
+
             final_text = " ".join(good_segments)
 
-            # Detect repeated hallucination pattern (same phrase 3+ times)
+            # Detect repeated hallucination pattern
             if final_text:
                 words = final_text.split()
                 if len(words) >= 6:
-                    # Check if the text is just the same short phrase repeated
                     half = len(words) // 2
                     first_half = " ".join(words[:half])
                     second_half = " ".join(words[half:2*half])
@@ -312,7 +437,8 @@ class STTEngine:
                         logger.info("Filtered repetitive hallucination: '%s'", final_text[:80])
                         final_text = ""
 
-            logger.info("STT final result: '%s'", final_text or "(empty)")
+            t_elapsed = time.time() - t_start
+            logger.info("STT final: '%s' (took %.1fs)", final_text or "(empty)", t_elapsed)
             asyncio.run_coroutine_threadsafe(
                 self._result_queue.put(STTResult(final_text or "(no speech detected)", is_final=True)),
                 loop,
@@ -332,11 +458,9 @@ class STTEngine:
 
         model_path = os.getenv("VOSK_MODEL_PATH", "")
         if not model_path:
-            from lieutenant_daemon.wake import WakeDetector
-            # Reuse model discovery
             models_dir = __import__("pathlib").Path(__file__).resolve().parent.parent / "models"
             for d in models_dir.iterdir():
-                if d.is_dir():
+                if d.is_dir() and "whisper" not in d.name.lower():
                     model_path = str(d)
                     break
 
@@ -375,7 +499,6 @@ class STTEngine:
                     break
                 continue
 
-        # Final
         result = json.loads(rec.FinalResult())
         final_text = result.get("text", "")
         asyncio.run_coroutine_threadsafe(

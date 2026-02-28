@@ -16,6 +16,7 @@ class State(str, enum.Enum):
     LISTENING = "LISTENING"
     THINKING = "THINKING"
     SPEAKING = "SPEAKING"
+    CONVERSING = "CONVERSING"  # Follow-up listening — no wake word needed
 
 
 class StateMachine:

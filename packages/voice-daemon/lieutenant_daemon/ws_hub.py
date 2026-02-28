@@ -69,6 +69,9 @@ class WSHub:
     async def send_agent_done(self):
         await self.broadcast({"type": "agent.done"})
 
+    async def send_llm_backend(self, name: str):
+        await self.broadcast({"type": "llm.backend", "name": name})
+
     async def send_tts_level(self, rms: float):
         await self.broadcast({"type": "tts.level", "rms": round(rms, 4)})
 

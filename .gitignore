@@ -25,3 +25,5 @@ Thumbs.db
 *.iml
 packages/voice-daemon/models/
 packages/agent-gateway/node_modules/
+*.bak
+*.orig

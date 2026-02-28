@@ -41,6 +41,11 @@ const COLORS: Record<DaemonState, { main: string; glow: string; bg: string }> = 
     glow: "rgba(108, 99, 255, 0.3)",
     bg: "rgba(108, 99, 255, 0.05)",
   },
+  CONVERSING: {
+    main: "rgba(74, 222, 128, 0.7)",
+    glow: "rgba(74, 222, 128, 0.2)",
+    bg: "rgba(74, 222, 128, 0.03)",
+  },
 };
 
 export function Waveform({ state, micRms, ttsRms }: Props) {
@@ -72,8 +77,9 @@ export function Waveform({ state, micRms, ttsRms }: Props) {
     const midY = H / 2;
 
     /* ── Compute target amplitude ─────────────────────────────── */
+    // Always use mic RMS so the waveform reflects real ambient sound
     const rawRms =
-      state === "LISTENING" ? micRms : state === "SPEAKING" ? ttsRms : 0;
+      state === "SPEAKING" ? ttsRms : micRms;
 
     // Smooth the RMS
     smoothRms.current += (rawRms - smoothRms.current) * SMOOTHING;
@@ -82,7 +88,7 @@ export function Waveform({ state, micRms, ttsRms }: Props) {
     switch (state) {
       case "IDLE":
         targetAmp.current =
-          IDLE_AMP + 0.03 * Math.sin(Date.now() * 0.001);
+          IDLE_AMP + Math.max(0.03 * Math.sin(Date.now() * 0.001), sRms * 3);
         break;
       case "LISTENING":
         targetAmp.current =
@@ -95,6 +101,10 @@ export function Waveform({ state, micRms, ttsRms }: Props) {
       case "SPEAKING":
         targetAmp.current =
           SPEAK_AMP_MIN + (SPEAK_AMP_MAX - SPEAK_AMP_MIN) * Math.min(sRms * 5, 1);
+        break;
+      case "CONVERSING":
+        targetAmp.current =
+          LISTEN_AMP_MIN + (LISTEN_AMP_MAX - LISTEN_AMP_MIN) * Math.min(sRms * 6, 1);
         break;
     }
 
